@@ -1,6 +1,7 @@
 #include "tensor.hpp"
 
 #include "../utils.hpp"
+#include "../ops/rearrange/op.hpp"
 
 #include <cstring>
 #include <numeric>
@@ -227,13 +228,26 @@ void Tensor::load(const void *src_) {
 }
 
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    if (isContiguous()) {
+        // Create a non-owning shared_ptr view to return "self" without copying.
+        return tensor_t(const_cast<Tensor *>(this), [](Tensor *) {});
+    }
+
+    auto out = Tensor::create(this->shape(), this->dtype(), this->deviceType(), this->deviceId());
+
+    // Use the rearrange op to materialize a contiguous copy.
+    auto self = tensor_t(const_cast<Tensor *>(this), [](Tensor *) {});
+    llaisys::ops::rearrange(out, self);
+    return out;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    const size_t new_numel = std::accumulate(shape.begin(), shape.end(), size_t(1), std::multiplies<size_t>());
+    CHECK_ARGUMENT(new_numel == this->numel(), "reshape: total number of elements must match");
+
+    // Ensure the data is contiguous before reshaping.
+    auto base = this->contiguous();
+    return base->view(shape);
 }
 
 tensor_t Tensor::to(llaisysDeviceType_t device_type, int device) const {
