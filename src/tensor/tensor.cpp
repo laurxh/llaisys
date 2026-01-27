@@ -245,7 +245,72 @@ tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {
     const size_t new_numel = std::accumulate(shape.begin(), shape.end(), size_t(1), std::multiplies<size_t>());
     CHECK_ARGUMENT(new_numel == this->numel(), "reshape: total number of elements must match");
 
-    // Ensure the data is contiguous before reshaping.
+    // Fast path: contiguous tensors can always be viewed as the new shape.
+    if (this->isContiguous()) {
+        return this->view(shape);
+    }
+
+    // Try to reshape without copying by collapsing contiguous stride groups.
+    const auto &old_shape = this->shape();
+    const auto &old_strides = this->strides();
+    const size_t old_ndim = old_shape.size();
+
+    std::vector<size_t> group_numel_rev;
+    std::vector<ptrdiff_t> group_base_stride_rev;
+    group_numel_rev.reserve(old_ndim);
+    group_base_stride_rev.reserve(old_ndim);
+
+    size_t current_group_numel = old_shape.back();
+    ptrdiff_t current_group_base_stride = old_strides.back();
+    for (size_t i = old_ndim - 1; i > 0; --i) {
+        const size_t prev = i - 1;
+        const bool same_group = old_strides[prev] == old_strides[i] * static_cast<ptrdiff_t>(old_shape[i]);
+        if (same_group) {
+            current_group_numel *= old_shape[prev];
+            current_group_base_stride = old_strides[i];
+        } else {
+            group_numel_rev.push_back(current_group_numel);
+            group_base_stride_rev.push_back(current_group_base_stride);
+            current_group_numel = old_shape[prev];
+            current_group_base_stride = old_strides[prev];
+        }
+    }
+    group_numel_rev.push_back(current_group_numel);
+    group_base_stride_rev.push_back(current_group_base_stride);
+
+    std::vector<size_t> group_numel(group_numel_rev.rbegin(), group_numel_rev.rend());
+    std::vector<ptrdiff_t> group_base_stride(group_base_stride_rev.rbegin(), group_base_stride_rev.rend());
+
+    std::vector<ptrdiff_t> new_strides(shape.size(), 0);
+    size_t group_idx = 0;
+    size_t group_remaining = group_numel.empty() ? 1 : group_numel[0];
+    ptrdiff_t base_stride = group_base_stride.empty() ? 1 : group_base_stride[0];
+
+    bool viewable = !shape.empty();
+    for (size_t i = 0; i < shape.size() && viewable; ++i) {
+        const size_t dim = shape[i];
+        if (dim == 0 || group_idx >= group_numel.size() || group_remaining % dim != 0) {
+            viewable = false;
+            break;
+        }
+        new_strides[i] = base_stride * static_cast<ptrdiff_t>(group_remaining / dim);
+        group_remaining /= dim;
+        if (group_remaining == 1) {
+            group_idx += 1;
+            if (group_idx < group_numel.size()) {
+                group_remaining = group_numel[group_idx];
+                base_stride = group_base_stride[group_idx];
+            }
+        }
+    }
+    viewable = viewable && group_idx == group_numel.size() && group_remaining == 1;
+
+    if (viewable) {
+        TensorMeta new_meta{this->dtype(), shape, new_strides};
+        return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage, _offset));
+    }
+
+    // Fallback: materialize a contiguous copy, then view.
     auto base = this->contiguous();
     return base->view(shape);
 }

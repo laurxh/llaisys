@@ -63,6 +63,14 @@ __C {
         size_t dim,
         size_t start,
         size_t end);
+
+    __export llaisysTensor_t tensorContiguous(
+        llaisysTensor_t tensor);
+
+    __export llaisysTensor_t tensorReshape(
+        llaisysTensor_t tensor,
+        size_t *shape,
+        size_t ndim);
 }
 
 #endif // LLAISYS_TENSOR_H

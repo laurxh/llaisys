@@ -84,6 +84,15 @@ class Tensor:
             tensor=LIB_LLAISYS.tensorView(self._tensor, _shape, c_size_t(len(shape)))
         )
 
+    def contiguous(self):
+        return Tensor(tensor=LIB_LLAISYS.tensorContiguous(self._tensor))
+
+    def reshape(self, shape: Sequence[int]):
+        _shape = (c_size_t * len(shape))(*shape)
+        return Tensor(
+            tensor=LIB_LLAISYS.tensorReshape(self._tensor, _shape, c_size_t(len(shape)))
+        )
+
     def permute(self, *perm: int) -> llaisysTensor_t:
         assert len(perm) == self.ndim()
         _perm = (c_size_t * len(perm))(*perm)
