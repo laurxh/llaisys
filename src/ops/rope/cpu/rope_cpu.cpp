@@ -25,14 +25,14 @@ void rope_impl_(T *out,
             const size_t head_base = pos_base + h * head_dim;
 
             for (size_t j = 0; j < half_dim; ++j) {
-                const double exponent = (2.0 * static_cast<float>(j)) / d;
-                const double inv_freq = std::pow(static_cast<float>(theta), -exponent);
+                const double exponent = (2.0 * static_cast<double>(j)) / d;
+                const double inv_freq = std::pow(static_cast<double>(theta), -exponent);
                 const double phi = p * inv_freq;
                 const float s = static_cast<float>(std::sin(phi));
                 const float c = static_cast<float>(std::cos(phi));
 
-                const float a = llaisys::utils::cast<float>(in[head_base + j]);
-                const float b = llaisys::utils::cast<float>(in[head_base + half_dim + j]);
+                const double a = llaisys::utils::cast<double>(in[head_base + j]);
+                const double b = llaisys::utils::cast<double>(in[head_base + half_dim + j]);
 
                 out[head_base + j] = llaisys::utils::cast<T>(a * c - b * s);
                 out[head_base + half_dim + j] = llaisys::utils::cast<T>(b * c + a * s);
