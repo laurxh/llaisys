@@ -27,7 +27,7 @@ target("llaisys-utils")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
 
-    add_files("src/utils/*.cpp")
+    add_files("src/utils/*.cpp", {exclude_files = "src/**/._*"})
 
     on_install(function (target) end)
 target_end()
@@ -44,7 +44,7 @@ target("llaisys-device")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
 
-    add_files("src/device/*.cpp")
+    add_files("src/device/*.cpp", {exclude_files = "src/**/._*"})
 
     on_install(function (target) end)
 target_end()
@@ -60,7 +60,7 @@ target("llaisys-core")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
 
-    add_files("src/core/*/*.cpp")
+    add_files("src/core/*/*.cpp", {exclude_files = "src/**/._*"})
 
     on_install(function (target) end)
 target_end()
@@ -75,7 +75,7 @@ target("llaisys-tensor")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
 
-    add_files("src/tensor/*.cpp")
+    add_files("src/tensor/*.cpp", {exclude_files = "src/**/._*"})
 
     on_install(function (target) end)
 target_end()
@@ -90,7 +90,7 @@ target("llaisys-ops")
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
     
-    add_files("src/ops/*/*.cpp")
+    add_files("src/ops/*/*.cpp", {exclude_files = "src/**/._*"})
 
     on_install(function (target) end)
 target_end()
@@ -105,7 +105,9 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
-    add_files("src/llaisys/*.cc")
+    add_files("src/llaisys/*.cc", {exclude_files = "src/**/._*"})
+    add_files("src/models/**/*.cpp", {exclude_files = "src/**/._*"})
+    add_files("src/models/qwen2/*.cpp", {exclude_files = "src/**/._*"})
     set_installdir(".")
 
     
