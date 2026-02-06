@@ -11,15 +11,14 @@ try:
 except Exception:  # pragma: no cover - optional fallback
     torch = None
 
-from ctypes import byref, c_int, c_int64, c_size_t, c_void_p
+from ctypes import POINTER, c_int64, c_size_t, c_void_p, cast, memmove
 
 from ..libllaisys import (
     LIB_LLAISYS,
     DeviceType,
     DataType,
-    LlaisysQwen2Meta,
-    LlaisysQwen2Weights,
 )
+from ..tensor import Tensor
 
 
 def _dtype_from_numpy(np_dtype):
@@ -113,8 +112,11 @@ def _load_tensor_allow_transpose(tensor_handle, array):
 
 
 class Qwen2:
+    """Minimal single-sequence Qwen2 runner for test/test_infer.py."""
 
     def __init__(self, model_path, device: DeviceType = DeviceType.CPU):
+        if device != DeviceType.CPU:
+            raise NotImplementedError("Minimal Qwen2 Python runner only supports CPU")
         model_path = Path(model_path)
         config_path = model_path / "config.json"
         if not config_path.exists():
@@ -156,35 +158,46 @@ class Qwen2:
 
         dh = int(config.get("head_dim", hs // nh))
 
-        meta = LlaisysQwen2Meta(
-            dtype=dtype,
-            nlayer=nlayer,
-            hs=hs,
-            nh=nh,
-            nkvh=nkvh,
-            dh=dh,
-            di=di,
-            maxseq=maxseq,
-            voc=voc,
-            epsilon=epsilon,
-            theta=theta,
-            end_token=end_token,
-        )
-
-        device_ids = (c_int * 1)(0)
-        self._model = LIB_LLAISYS.llaisysQwen2ModelCreate(byref(meta), c_int(device), device_ids, 1)
-        if not self._model:
-            raise RuntimeError("Failed to create Qwen2 model")
-
-        self._meta = meta
+        self._meta = type("Qwen2Meta", (), {})()
+        self._meta.dtype = dtype
+        self._meta.nlayer = nlayer
+        self._meta.hs = hs
+        self._meta.nh = nh
+        self._meta.nkvh = nkvh
+        self._meta.dh = dh
+        self._meta.di = di
+        self._meta.maxseq = maxseq
+        self._meta.voc = voc
+        self._meta.epsilon = epsilon
+        self._meta.theta = theta
+        self._meta.end_token = end_token
         self._device = device
+        self._dtype = DataType(self._meta.dtype)
         self._end_token = end_token
+        self._scale = float(1.0 / np.sqrt(float(self._meta.dh)))
+        self._cur_len = 0
 
-        weights_ptr = LIB_LLAISYS.llaisysQwen2ModelWeights(self._model)
-        if not weights_ptr:
-            raise RuntimeError("Failed to get model weights")
-        self._weights_ptr = weights_ptr
-        self._weights: LlaisysQwen2Weights = weights_ptr.contents
+        self._k_cache = []
+        self._v_cache = []
+        for _ in range(nlayer):
+            self._k_cache.append(Tensor((self._meta.maxseq, self._meta.nkvh, self._meta.dh), self._dtype, self._device, 0))
+            self._v_cache.append(Tensor((self._meta.maxseq, self._meta.nkvh, self._meta.dh), self._dtype, self._device, 0))
+
+        self._in_embed = Tensor((voc, hs), self._dtype, self._device, 0)
+        self._out_embed = Tensor((voc, hs), self._dtype, self._device, 0)
+        self._out_norm_w = Tensor((hs,), self._dtype, self._device, 0)
+        self._attn_norm_w = [Tensor((hs,), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._attn_q_w = [Tensor((nh * dh, hs), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._attn_q_b = [Tensor((nh * dh,), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._attn_k_w = [Tensor((nkvh * dh, hs), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._attn_k_b = [Tensor((nkvh * dh,), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._attn_v_w = [Tensor((nkvh * dh, hs), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._attn_v_b = [Tensor((nkvh * dh,), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._attn_o_w = [Tensor((hs, nh * dh), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._mlp_norm_w = [Tensor((hs,), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._mlp_gate_w = [Tensor((di, hs), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._mlp_up_w = [Tensor((di, hs), self._dtype, self._device, 0) for _ in range(nlayer)]
+        self._mlp_down_w = [Tensor((hs, di), self._dtype, self._device, 0) for _ in range(nlayer)]
 
         loaded = {
             "in_embed": False,
@@ -205,7 +218,6 @@ class Qwen2:
             "attn_k_b": [False] * nlayer,
             "attn_v_b": [False] * nlayer,
         }
-
         in_embed_array = None
 
         layer_re = re.compile(r"(?:model\.)?layers\.(\d+)\.(.+)")
@@ -218,15 +230,15 @@ class Qwen2:
                 for name_ in data_.keys():
                     if name_ in ("model.embed_tokens.weight", "embed_tokens.weight"):
                         in_embed_array = data_.get_tensor(name_)
-                        _load_tensor(self._weights.in_embed, in_embed_array)
+                        _load_tensor(self._in_embed.lib_tensor(), in_embed_array)
                         loaded["in_embed"] = True
                         continue
                     if name_ in ("lm_head.weight", "model.lm_head.weight"):
-                        _load_tensor_allow_transpose(self._weights.out_embed, data_.get_tensor(name_))
+                        _load_tensor_allow_transpose(self._out_embed.lib_tensor(), data_.get_tensor(name_))
                         loaded["out_embed"] = True
                         continue
                     if name_ in ("model.norm.weight", "norm.weight"):
-                        _load_tensor(self._weights.out_norm_w, data_.get_tensor(name_))
+                        _load_tensor(self._out_norm_w.lib_tensor(), data_.get_tensor(name_))
                         loaded["out_norm_w"] = True
                         continue
 
@@ -241,40 +253,40 @@ class Qwen2:
                         continue
 
                     if suffix == "input_layernorm.weight":
-                        _load_tensor(self._weights.attn_norm_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._attn_norm_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["attn_norm_w"][layer] = True
                     elif suffix == "self_attn.q_proj.weight":
-                        _load_tensor(self._weights.attn_q_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._attn_q_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["attn_q_w"][layer] = True
                     elif suffix == "self_attn.q_proj.bias":
-                        _load_tensor(self._weights.attn_q_b[layer], data_.get_tensor(name_))
+                        _load_tensor(self._attn_q_b[layer].lib_tensor(), data_.get_tensor(name_))
                         bias_loaded["attn_q_b"][layer] = True
                     elif suffix == "self_attn.k_proj.weight":
-                        _load_tensor(self._weights.attn_k_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._attn_k_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["attn_k_w"][layer] = True
                     elif suffix == "self_attn.k_proj.bias":
-                        _load_tensor(self._weights.attn_k_b[layer], data_.get_tensor(name_))
+                        _load_tensor(self._attn_k_b[layer].lib_tensor(), data_.get_tensor(name_))
                         bias_loaded["attn_k_b"][layer] = True
                     elif suffix == "self_attn.v_proj.weight":
-                        _load_tensor(self._weights.attn_v_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._attn_v_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["attn_v_w"][layer] = True
                     elif suffix == "self_attn.v_proj.bias":
-                        _load_tensor(self._weights.attn_v_b[layer], data_.get_tensor(name_))
+                        _load_tensor(self._attn_v_b[layer].lib_tensor(), data_.get_tensor(name_))
                         bias_loaded["attn_v_b"][layer] = True
                     elif suffix == "self_attn.o_proj.weight":
-                        _load_tensor(self._weights.attn_o_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._attn_o_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["attn_o_w"][layer] = True
                     elif suffix == "post_attention_layernorm.weight":
-                        _load_tensor(self._weights.mlp_norm_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._mlp_norm_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["mlp_norm_w"][layer] = True
                     elif suffix == "mlp.gate_proj.weight":
-                        _load_tensor(self._weights.mlp_gate_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._mlp_gate_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["mlp_gate_w"][layer] = True
                     elif suffix == "mlp.up_proj.weight":
-                        _load_tensor(self._weights.mlp_up_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._mlp_up_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["mlp_up_w"][layer] = True
                     elif suffix == "mlp.down_proj.weight":
-                        _load_tensor(self._weights.mlp_down_w[layer], data_.get_tensor(name_))
+                        _load_tensor(self._mlp_down_w[layer].lib_tensor(), data_.get_tensor(name_))
                         loaded["mlp_down_w"][layer] = True
 
         missing = []
@@ -286,7 +298,7 @@ class Qwen2:
         if not loaded["out_embed"] and loaded["in_embed"]:
             if in_embed_array is None:
                 raise RuntimeError("in_embed loaded but source array missing for tying out_embed")
-            _load_tensor(self._weights.out_embed, in_embed_array)
+            _load_tensor(self._out_embed.lib_tensor(), in_embed_array)
             loaded["out_embed"] = True
 
         if not loaded["out_embed"]:
@@ -309,14 +321,149 @@ class Qwen2:
         if missing:
             raise RuntimeError(f"Missing model weights: {', '.join(missing[:5])} ...")
 
-    def __del__(self):
-        if hasattr(self, "_model") and self._model:
-            LIB_LLAISYS.llaisysQwen2ModelDestroy(self._model)
-            self._model = None
+        # q/k/v bias might be absent in some checkpoints; default to zero.
+        zero_q = np.zeros((nh * dh,), dtype=np.float32)
+        zero_kv = np.zeros((nkvh * dh,), dtype=np.float32)
+        for i in range(nlayer):
+            if not bias_loaded["attn_q_b"][i]:
+                _load_tensor_allow_transpose(self._attn_q_b[i].lib_tensor(), zero_q)
+            if not bias_loaded["attn_k_b"][i]:
+                _load_tensor_allow_transpose(self._attn_k_b[i].lib_tensor(), zero_kv)
+            if not bias_loaded["attn_v_b"][i]:
+                _load_tensor_allow_transpose(self._attn_v_b[i].lib_tensor(), zero_kv)
 
-    def _infer(self, tokens):
-        arr = (c_int64 * len(tokens))(*tokens)
-        return int(LIB_LLAISYS.llaisysQwen2ModelInfer(self._model, arr, c_size_t(len(tokens))))
+    def __del__(self):
+        self._k_cache = []
+        self._v_cache = []
+
+    @staticmethod
+    def _dtype_nbytes(dtype: DataType) -> int:
+        if dtype in (DataType.BF16, DataType.F16, DataType.I16, DataType.U16):
+            return 2
+        if dtype in (DataType.F32, DataType.I32, DataType.U32):
+            return 4
+        if dtype in (DataType.I64, DataType.U64, DataType.F64):
+            return 8
+        if dtype in (DataType.BYTE, DataType.BOOL, DataType.I8, DataType.U8):
+            return 1
+        raise ValueError(f"Unsupported dtype element size: {dtype}")
+
+    def _load_i64_scalar(self, tensor: Tensor, value: int):
+        arr = np.asarray([value], dtype=np.int64)
+        tensor.load(c_void_p(arr.ctypes.data))
+
+    def _new(self, *shape: int, dtype: DataType | None = None) -> Tensor:
+        return Tensor(shape, self._dtype if dtype is None else dtype, self._device, 0)
+
+    def _write_cache(self, cache: Tensor, src: Tensor, pos: int):
+        per_token = int(self._meta.nkvh * self._meta.dh)
+        elem_size = self._dtype_nbytes(self._dtype)
+        copy_bytes = per_token * elem_size
+        dst = int(cast(cache.data_ptr(), c_void_p).value) + pos * copy_bytes
+        src_ptr = cast(src.data_ptr(), c_void_p)
+        memmove(dst, src_ptr, copy_bytes)
+
+    def _forward_layer(self, x: Tensor, pos_ids: Tensor, layer: int) -> Tensor:
+        x_norm = self._new(1, self._meta.hs)
+        LIB_LLAISYS.llaisysRmsNorm(
+            x_norm.lib_tensor(), x.lib_tensor(), self._attn_norm_w[layer].lib_tensor(), float(self._meta.epsilon)
+        )
+
+        q_lin = self._new(1, self._meta.nh * self._meta.dh)
+        k_lin = self._new(1, self._meta.nkvh * self._meta.dh)
+        v_lin = self._new(1, self._meta.nkvh * self._meta.dh)
+        LIB_LLAISYS.llaisysLinear(
+            q_lin.lib_tensor(), x_norm.lib_tensor(), self._attn_q_w[layer].lib_tensor(), self._attn_q_b[layer].lib_tensor()
+        )
+        LIB_LLAISYS.llaisysLinear(
+            k_lin.lib_tensor(), x_norm.lib_tensor(), self._attn_k_w[layer].lib_tensor(), self._attn_k_b[layer].lib_tensor()
+        )
+        LIB_LLAISYS.llaisysLinear(
+            v_lin.lib_tensor(), x_norm.lib_tensor(), self._attn_v_w[layer].lib_tensor(), self._attn_v_b[layer].lib_tensor()
+        )
+
+        q_rope = self._new(1, self._meta.nh, self._meta.dh)
+        k_rope = self._new(1, self._meta.nkvh, self._meta.dh)
+        q_view = q_lin.view(1, self._meta.nh, self._meta.dh)
+        k_view = k_lin.view(1, self._meta.nkvh, self._meta.dh)
+        LIB_LLAISYS.llaisysROPE(
+            q_rope.lib_tensor(), q_view.lib_tensor(), pos_ids.lib_tensor(), float(self._meta.theta)
+        )
+        v = v_lin.view(1, self._meta.nkvh, self._meta.dh)
+        LIB_LLAISYS.llaisysROPE(
+            k_rope.lib_tensor(), k_view.lib_tensor(), pos_ids.lib_tensor(), float(self._meta.theta)
+        )
+
+        self._write_cache(self._k_cache[layer], k_rope, self._cur_len)
+        self._write_cache(self._v_cache[layer], v, self._cur_len)
+        k_slice = self._k_cache[layer].slice(0, 0, self._cur_len + 1)
+        v_slice = self._v_cache[layer].slice(0, 0, self._cur_len + 1)
+        k_cache = k_slice.contiguous()
+        v_cache = v_slice.contiguous()
+
+        attn = self._new(1, self._meta.nh, self._meta.dh)
+        LIB_LLAISYS.llaisysSelfAttention(
+            attn.lib_tensor(), q_rope.lib_tensor(), k_cache.lib_tensor(), v_cache.lib_tensor(), self._scale
+        )
+        attn_proj = self._new(1, self._meta.hs)
+        attn_2d = attn.view(1, self._meta.hs)
+        LIB_LLAISYS.llaisysLinear(
+            attn_proj.lib_tensor(), attn_2d.lib_tensor(), self._attn_o_w[layer].lib_tensor(), None
+        )
+
+        x_attn = self._new(1, self._meta.hs)
+        LIB_LLAISYS.llaisysAdd(x_attn.lib_tensor(), attn_proj.lib_tensor(), x.lib_tensor())
+
+        mlp_norm = self._new(1, self._meta.hs)
+        LIB_LLAISYS.llaisysRmsNorm(
+            mlp_norm.lib_tensor(), x_attn.lib_tensor(), self._mlp_norm_w[layer].lib_tensor(), float(self._meta.epsilon)
+        )
+        gate = self._new(1, self._meta.di)
+        up = self._new(1, self._meta.di)
+        swiglu_out = self._new(1, self._meta.di)
+        down = self._new(1, self._meta.hs)
+        LIB_LLAISYS.llaisysLinear(gate.lib_tensor(), mlp_norm.lib_tensor(), self._mlp_gate_w[layer].lib_tensor(), None)
+        LIB_LLAISYS.llaisysLinear(up.lib_tensor(), mlp_norm.lib_tensor(), self._mlp_up_w[layer].lib_tensor(), None)
+        LIB_LLAISYS.llaisysSwiGLU(swiglu_out.lib_tensor(), gate.lib_tensor(), up.lib_tensor())
+        LIB_LLAISYS.llaisysLinear(down.lib_tensor(), swiglu_out.lib_tensor(), self._mlp_down_w[layer].lib_tensor(), None)
+
+        x_next = self._new(1, self._meta.hs)
+        LIB_LLAISYS.llaisysAdd(x_next.lib_tensor(), down.lib_tensor(), x_attn.lib_tensor())
+        return x_next
+
+    def _forward_one(self, token: int) -> int:
+        idx = self._new(1, dtype=DataType.I64)
+        pos_ids = self._new(1, dtype=DataType.I64)
+        self._load_i64_scalar(idx, token)
+        self._load_i64_scalar(pos_ids, self._cur_len)
+
+        x = self._new(1, self._meta.hs)
+        LIB_LLAISYS.llaisysEmbedding(x.lib_tensor(), idx.lib_tensor(), self._in_embed.lib_tensor())
+        for layer in range(int(self._meta.nlayer)):
+            x = self._forward_layer(x, pos_ids, layer)
+
+        final_norm = self._new(1, self._meta.hs)
+        logits = self._new(1, self._meta.voc)
+        LIB_LLAISYS.llaisysRmsNorm(
+            final_norm.lib_tensor(), x.lib_tensor(), self._out_norm_w.lib_tensor(), float(self._meta.epsilon)
+        )
+        LIB_LLAISYS.llaisysLinear(logits.lib_tensor(), final_norm.lib_tensor(), self._out_embed.lib_tensor(), None)
+
+        max_idx = self._new(1, dtype=DataType.I64)
+        max_val = self._new(1)
+        LIB_LLAISYS.llaisysArgmax(max_idx.lib_tensor(), max_val.lib_tensor(), logits.lib_tensor())
+        self._cur_len += 1
+        return int(cast(max_idx.data_ptr(), POINTER(c_int64))[0])
+
+    def _prefill(self, tokens: Sequence[int]) -> int:
+        if len(tokens) == 0:
+            raise ValueError("tokens must not be empty")
+        if len(tokens) > int(self._meta.maxseq):
+            raise ValueError("sequence length exceeds maxseq")
+        next_token = -1
+        for token in tokens:
+            next_token = self._forward_one(int(token))
+        return next_token
 
     def generate(
         self,
@@ -328,15 +475,22 @@ class Qwen2:
     ):
         if max_new_tokens is None:
             max_new_tokens = 128
+        if max_new_tokens <= 0:
+            return list(inputs)
         if len(inputs) == 0:
             return []
+        # Keep signature compatible with test_infer.py; decoding is greedy only.
+        _ = (top_k, top_p, temperature)
 
+        self._cur_len = 0
         tokens = list(inputs)
-        next_token = self._infer(tokens)
+        next_token = self._prefill(tokens)
         tokens.append(next_token)
 
         for _ in range(max_new_tokens - 1):
-            next_token = self._infer([next_token])
+            if self._cur_len >= int(self._meta.maxseq):
+                break
+            next_token = self._forward_one(next_token)
             tokens.append(next_token)
             if next_token == self._end_token:
                 break

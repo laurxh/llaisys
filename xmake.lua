@@ -86,6 +86,10 @@ target("llaisys-ops")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    -- Keep symbols in release builds for native profiling.
+    set_symbols("debug")
+    set_strip("none")
+    add_cxflags("-g", "-fno-omit-frame-pointer")
     if not is_plat("windows") then
         add_cxflags("-fPIC", "-Wno-unknown-pragmas")
     end
@@ -105,9 +109,11 @@ target("llaisys")
 
     set_languages("cxx17")
     set_warnings("all", "error")
+    -- Keep symbols in release builds for native profiling.
+    set_symbols("debug")
+    set_strip("none")
+    add_cxflags("-g", "-fno-omit-frame-pointer")
     add_files("src/llaisys/*.cc", {exclude_files = "src/**/._*"})
-    add_files("src/models/**/*.cpp", {exclude_files = "src/**/._*"})
-    add_files("src/models/qwen2/*.cpp", {exclude_files = "src/**/._*"})
     set_installdir(".")
 
     
